@@ -1,0 +1,17 @@
+name = "repost-bot"
+main = "src/index.js"
+compatibility_date = "2024-09-01"
+
+# هر ۲ دقیقه یک‌بار کانال‌های مبدا چک می‌شوند
+[triggers]
+crons = ["*/2 * * * *"]
+
+# بعد از ساخت KV Namespace در داشبورد Cloudflare یا با دستور زیر،
+# مقدار id را جایگزین کن:
+# npx wrangler kv namespace create BOT_KV
+[[kv_namespaces]]
+binding = "BOT_KV"
+id = "REPLACE_WITH_YOUR_KV_NAMESPACE_ID"
+
+# این‌ها به‌صورت GitHub Secrets ست می‌شوند، نه اینجا:
+# BOT_TOKEN, ADMIN_IDS, WEBHOOK_SECRET
