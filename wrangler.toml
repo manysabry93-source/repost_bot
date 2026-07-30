@@ -11,7 +11,7 @@ crons = ["*/2 * * * *"]
 # npx wrangler kv namespace create BOT_KV
 [[kv_namespaces]]
 binding = "BOT_KV"
-id = "14977089594943f7be5cfd87d633da83"
+id = "REPLACE_WITH_YOUR_KV_NAMESPACE_ID"
 
 # این‌ها به‌صورت GitHub Secrets ست می‌شوند، نه اینجا:
 # BOT_TOKEN, ADMIN_IDS, WEBHOOK_SECRET
