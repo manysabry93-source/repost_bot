@@ -1489,20 +1489,31 @@ export default {
       });
     }
 
+    if (url.pathname === "/rubika-test") {
+      if (!rubikaEnabled(env)) {
+        return new Response("RUBIKA_TOKEN not set", { status: 400 });
+      }
+      const me = await rb(env, "getMe", {});
+      return new Response(JSON.stringify({ getMe: me }, null, 2), {
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+
     if (url.pathname === "/rubika-setup") {
       if (!rubikaEnabled(env)) {
         return new Response("RUBIKA_TOKEN not set", { status: 400 });
       }
       const endpointUrl = `${url.origin}/rubika-webhook/${env.WEBHOOK_SECRET}`;
-      const r1 = await rb(env, "updateBotEndpoint", {
-        url: endpointUrl,
-        type: "ReceiveUpdate",
-      });
-      const r2 = await rb(env, "updateBotEndpoint", {
-        url: endpointUrl,
-        type: "ReceiveInlineMessage",
-      });
-      return new Response(JSON.stringify({ r1, r2 }, null, 2), {
+      // Try a few plausible casings/spellings for the "type" enum since the
+      // official example only showed an unrelated value ("GetSelectionItem").
+      const attempts = [];
+      for (const t of ["ReceiveUpdate", "receiveUpdate", "Update"]) {
+        attempts.push({ type: t, result: await rb(env, "updateBotEndpoints", { url: endpointUrl, type: t }) });
+      }
+      for (const t of ["ReceiveInlineMessage", "receiveInlineMessage", "InlineMessage"]) {
+        attempts.push({ type: t, result: await rb(env, "updateBotEndpoints", { url: endpointUrl, type: t }) });
+      }
+      return new Response(JSON.stringify({ attempts }, null, 2), {
         headers: { "Content-Type": "application/json" },
       });
     }
