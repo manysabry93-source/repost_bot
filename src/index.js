@@ -596,8 +596,8 @@ async function pollSources(env) {
   if (totalSent > 0) {
     const total = parseInt((await env.BOT_KV.get("stats_total")) || "0", 10);
     await env.BOT_KV.put("stats_total", String(total + totalSent));
+    await env.BOT_KV.put("stats_last_run", new Date().toISOString());
   }
-  await env.BOT_KV.put("stats_last_run", new Date().toISOString());
 }
 
 // ------------------------------------------------------------
