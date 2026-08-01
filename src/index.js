@@ -3,6 +3,15 @@
 // Cloudflare Workers + KV
 // ============================================================
 
+import * as konkur from "./konkur.js";
+
+function base64ToBytes(b64) {
+  const binary = atob(b64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  return bytes;
+}
+
 const TG_API = (env) => `https://api.telegram.org/bot${env.BOT_TOKEN}`;
 
 function getAdminIds(env) {
@@ -407,6 +416,12 @@ function reviewButtons(id) {
   };
 }
 
+function reviewButtonsKonkur(id) {
+  const base = reviewButtons(id);
+  base.inline_keyboard.push([{ text: "✏️ ویرایش متن", callback_data: `rev_edit_${id}` }]);
+  return base;
+}
+
 async function loadPending(env, id) {
   const raw = await env.BOT_KV.get(`pending:${id}`);
   return raw ? JSON.parse(raw) : null;
@@ -429,9 +444,45 @@ async function queueForReview(env, pendingData) {
 async function sendForReview(env, pending) {
   const reviewerChatId = await getReviewerChatId(env);
   if (!reviewerChatId) return false;
-  const label = "🕵️ مشاور تایید";
+  const label = pending.kind === "konkur" ? `🕵️ مشاور تایید — 🎓 ${pending.category || ""}` : "🕵️ مشاور تایید";
   const caption = `${label}\n\n${pending.text || ""}`.trim();
-  const buttons = reviewButtons(pending.id);
+  const buttons = pending.kind === "konkur" ? reviewButtonsKonkur(pending.id) : reviewButtons(pending.id);
+
+  if (pending.kind === "konkur") {
+    if (pending.stickerFileId) {
+      try {
+        await tg(env, "sendSticker", { chat_id: reviewerChatId, sticker: pending.stickerFileId });
+      } catch (e) {}
+    }
+    if (pending.imageUrl) {
+      if (caption.length <= 900) {
+        await tg(env, "sendPhoto", { chat_id: reviewerChatId, photo: pending.imageUrl, caption, reply_markup: buttons });
+      } else {
+        await tg(env, "sendPhoto", { chat_id: reviewerChatId, photo: pending.imageUrl });
+        await tg(env, "sendMessage", { chat_id: reviewerChatId, text: caption, reply_markup: buttons });
+      }
+    } else if (pending.aiImageBase64) {
+      const bytes = base64ToBytes(pending.aiImageBase64);
+      await tgSendMediaBlob(env, reviewerChatId, "sendPhoto", "photo", new Blob([bytes]), "ai.png", caption, buttons);
+    } else {
+      await tg(env, "sendMessage", { chat_id: reviewerChatId, text: caption, reply_markup: buttons });
+    }
+    if (pending.pdfBase64) {
+      try {
+        const bytes = base64ToBytes(pending.pdfBase64);
+        await tgSendMediaBlob(
+          env,
+          reviewerChatId,
+          "sendDocument",
+          "document",
+          new Blob([bytes]),
+          `${(pending.topic || "content").slice(0, 40)}.pdf`,
+          "📄 فایل PDF"
+        );
+      } catch (e) {}
+    }
+    return true;
+  }
 
   if (pending.kind === "rubika_file" && pending.rubikaFileId) {
     const blob = await rubikaDownloadFile(env, pending.rubikaFileId);
@@ -480,6 +531,48 @@ async function publishPending(env, pending, useSecondary) {
   const rubikaTargets = useSecondary
     ? await getRubikaSecondaryDestinations(env)
     : await getRubikaDestinations(env);
+
+  if (pending.kind === "konkur") {
+    const finalText = [pending.text, signature].filter(Boolean).join("\n\n");
+    for (const chat of telegramTargets) {
+      const chatIdTg = chat.username ? `@${chat.username}` : chat.id;
+      try {
+        if (pending.stickerFileId) {
+          await tg(env, "sendSticker", { chat_id: chatIdTg, sticker: pending.stickerFileId });
+        }
+        if (pending.imageUrl) {
+          await tg(env, "sendPhoto", { chat_id: chatIdTg, photo: pending.imageUrl, caption: finalText });
+        } else if (pending.aiImageBase64) {
+          const bytes = base64ToBytes(pending.aiImageBase64);
+          await tgSendMediaBlob(env, chatIdTg, "sendPhoto", "photo", new Blob([bytes]), "ai.png", finalText);
+        } else {
+          await tg(env, "sendMessage", { chat_id: chatIdTg, text: finalText });
+        }
+        if (pending.pdfBase64) {
+          const bytes = base64ToBytes(pending.pdfBase64);
+          await tgSendMediaBlob(
+            env,
+            chatIdTg,
+            "sendDocument",
+            "document",
+            new Blob([bytes]),
+            `${(pending.topic || "content").slice(0, 40)}.pdf`
+          );
+        }
+      } catch (e) {}
+    }
+    for (const chat of rubikaTargets) {
+      try {
+        if (pending.imageUrl) {
+          await rubikaSendPhoto(env, chat.chat_id, pending.imageUrl, finalText);
+        } else {
+          await rb(env, "sendMessage", { chat_id: chat.chat_id, text: finalText });
+        }
+      } catch (e) {}
+    }
+    await konkur.bumpKonkurStat(env, "approved", pending.category);
+    return;
+  }
 
   if (pending.kind === "rubika_file" && pending.rubikaFileId) {
     const blob = await rubikaDownloadFile(env, pending.rubikaFileId);
@@ -596,8 +689,8 @@ async function pollSources(env) {
   if (totalSent > 0) {
     const total = parseInt((await env.BOT_KV.get("stats_total")) || "0", 10);
     await env.BOT_KV.put("stats_total", String(total + totalSent));
-    await env.BOT_KV.put("stats_last_run", new Date().toISOString());
   }
+  await env.BOT_KV.put("stats_last_run", new Date().toISOString());
 }
 
 // ------------------------------------------------------------
@@ -641,6 +734,27 @@ function mainMenu(env) {
   rows.push([{ text: "🧪 حالت آزمایشی: تغییر وضعیت", callback_data: "toggle_test" }]);
   rows.push([{ text: "⏸ توقف / ▶️ شروع", callback_data: "toggle_pause" }]);
   rows.push([{ text: "📊 آمار", callback_data: "stats" }]);
+  rows.push([{ text: "🎓 محتوای کنکوری", callback_data: "konkur_menu" }]);
+  return { inline_keyboard: rows };
+}
+
+async function konkurSubMenu(env) {
+  const settings = await konkur.getKonkurSettings(env);
+  const rows = [
+    [
+      {
+        text: settings.enabled ? "🟢 فعال (بزن تا خاموش شود)" : "🔴 غیرفعال (بزن تا روشن شود)",
+        callback_data: "konkur_toggle",
+      },
+    ],
+    [{ text: "✍️ ساخت محتوا با موضوع دلخواه", callback_data: "konkur_manual" }],
+    [{ text: `⏱ بازه‌ی خودکار: هر ${settings.intervalHours} ساعت (تغییر)`, callback_data: "konkur_interval" }],
+    [{ text: `🕐 ساعات فعال (تهران): ${settings.activeStart} تا ${settings.activeEnd} (تغییر)`, callback_data: "konkur_hours" }],
+    [{ text: "🏷 مدیریت استیکرهای دسته‌بندی", callback_data: "konkur_stickers" }],
+    [{ text: "🌐 مدیریت سایت‌های تحت پایش", callback_data: "konkur_sites" }],
+    [{ text: "📈 آمار محتوای کنکوری", callback_data: "konkur_stats" }],
+    [{ text: "⬅️ بازگشت به منوی اصلی", callback_data: "back_main" }],
+  ];
   return { inline_keyboard: rows };
 }
 
@@ -686,6 +800,31 @@ async function handleAdminMessage(env, msg) {
   const adminId = msg.from.id;
   const chatId = msg.chat.id;
   const text = (msg.text || "").trim();
+
+  if (msg.sticker) {
+    const state = await getState(env, adminId);
+    if (state && state.action === "konkur_add_sticker") {
+      const stickers = await konkur.getKonkurStickers(env);
+      const list = stickers[state.category] || [];
+      list.push(msg.sticker.file_id);
+      stickers[state.category] = list;
+      await konkur.setKonkurStickers(env, stickers);
+      await tg(env, "sendMessage", {
+        chat_id: chatId,
+        text: `✅ استیکر برای دسته «${state.category}» ذخیره شد. استیکر بعدی رو بفرست یا برای پایان بنویس: تمام`,
+      });
+    }
+    return;
+  }
+
+  if (text === "تمام") {
+    const state = await getState(env, adminId);
+    if (state && state.action === "konkur_add_sticker") {
+      await clearState(env, adminId);
+      await tg(env, "sendMessage", { chat_id: chatId, text: "✅ تموم شد.", reply_markup: mainMenu(env) });
+      return;
+    }
+  }
 
   if (text === "/start" || text === "/menu") {
     await clearState(env, adminId);
@@ -902,6 +1041,104 @@ async function handleAdminMessage(env, msg) {
     });
     return;
   }
+
+  if (state.action === "konkur_manual_topic") {
+    await clearState(env, adminId);
+    await tg(env, "sendMessage", { chat_id: chatId, text: "⏳ در حال جستجو و آماده‌سازی محتوا..." });
+    const content = await konkur.buildKonkurContent(
+      env,
+      { getFilterKeywords, applyFilters, getSignature, tg, getAdminIds },
+      text,
+      "کنکور"
+    );
+    if (!content) {
+      await tg(env, "sendMessage", { chat_id: chatId, text: "❌ سهمیه‌ی جستجو تموم شده یا خطایی پیش اومد." });
+      return;
+    }
+    await queueForReview(env, content);
+    await tg(env, "sendMessage", { chat_id: chatId, text: "✅ محتوا آماده شد و برای تایید فرستاده شد." });
+    return;
+  }
+
+  if (state.action === "konkur_set_interval") {
+    const n = parseInt(text, 10);
+    if (!(n >= 1 && n <= 8)) {
+      await tg(env, "sendMessage", { chat_id: chatId, text: "یه عدد بین ۱ تا ۸ بفرست." });
+      return;
+    }
+    const settings = await konkur.getKonkurSettings(env);
+    settings.intervalHours = n;
+    await konkur.setKonkurSettings(env, settings);
+    await clearState(env, adminId);
+    await tg(env, "sendMessage", {
+      chat_id: chatId,
+      text: `✅ بازه‌ی خودکار روی هر ${n} ساعت تنظیم شد.`,
+      reply_markup: await konkurSubMenu(env),
+    });
+    return;
+  }
+
+  if (state.action === "konkur_set_hours") {
+    const m = text.match(/(\d{1,2})\D+(\d{1,2})/);
+    if (!m) {
+      await tg(env, "sendMessage", { chat_id: chatId, text: "فرمت درست نیست. مثلاً بنویس: 8-23" });
+      return;
+    }
+    const start = parseInt(m[1], 10);
+    const end = parseInt(m[2], 10);
+    if (!(start >= 0 && start <= 23 && end >= 0 && end <= 23)) {
+      await tg(env, "sendMessage", { chat_id: chatId, text: "ساعت‌ها باید بین ۰ تا ۲۳ باشن." });
+      return;
+    }
+    const settings = await konkur.getKonkurSettings(env);
+    settings.activeStart = start;
+    settings.activeEnd = end;
+    await konkur.setKonkurSettings(env, settings);
+    await clearState(env, adminId);
+    await tg(env, "sendMessage", {
+      chat_id: chatId,
+      text: `✅ ساعات فعال (به وقت تهران) روی ${start} تا ${end} تنظیم شد.`,
+      reply_markup: await konkurSubMenu(env),
+    });
+    return;
+  }
+
+  if (state.action === "konkur_add_site") {
+    const lines = text.split("\n").map((l) => l.trim()).filter(Boolean);
+    const list = await konkur.getKonkurSites(env);
+    const added = [];
+    for (const url of lines) {
+      if (!/^https?:\/\//i.test(url)) continue;
+      if (list.find((s) => s.url === url)) continue;
+      list.push({ url, lastHash: null });
+      added.push(url);
+    }
+    await konkur.setKonkurSites(env, list);
+    await clearState(env, adminId);
+    await tg(env, "sendMessage", {
+      chat_id: chatId,
+      text: added.length ? `✅ اضافه شد:\n${added.join("\n")}` : "چیزی اضافه نشد (باید لینک کامل با http/https باشه).",
+      reply_markup: await konkurSubMenu(env),
+    });
+    return;
+  }
+
+  if (state.action === "konkur_edit_text") {
+    const pending = await loadPending(env, state.id);
+    if (!pending) {
+      await clearState(env, adminId);
+      await tg(env, "sendMessage", { chat_id: chatId, text: "این محتوا دیگه در دسترس نیست." });
+      return;
+    }
+    pending.text = text;
+    await env.BOT_KV.put(`pending:${pending.id}`, JSON.stringify(pending), {
+      expirationTtl: 60 * 60 * 24 * 7,
+    });
+    await clearState(env, adminId);
+    await tg(env, "sendMessage", { chat_id: chatId, text: "✅ متن بروزرسانی شد، پیش‌نمایش جدید:" });
+    await sendForReview(env, pending);
+    return;
+  }
 }
 
 async function handleCallback(env, cq) {
@@ -941,8 +1178,126 @@ async function handleCallback(env, cq) {
       await publishPending(env, pending, true);
       await tg(env, "sendMessage", { chat_id: chatId, text: "↪️ به کانال دوم ارسال شد." });
     } else {
+      if (pending.kind === "konkur") await konkur.bumpKonkurStat(env, "rejected", pending.category);
       await tg(env, "sendMessage", { chat_id: chatId, text: "🚫 منتشر نشد." });
     }
+    return;
+  }
+
+  if (data.startsWith("rev_edit_")) {
+    const id = data.replace("rev_edit_", "");
+    const pending = await loadPending(env, id);
+    if (!pending) {
+      await tg(env, "sendMessage", { chat_id: chatId, text: "این محتوا قبلاً پردازش شده یا منقضی شده." });
+      return;
+    }
+    await setState(env, adminId, { action: "konkur_edit_text", id });
+    await tg(env, "sendMessage", { chat_id: chatId, text: "متن جدید رو بفرست تا جایگزین بشه:" });
+    return;
+  }
+
+  if (data === "konkur_menu") {
+    await tg(env, "sendMessage", { chat_id: chatId, text: "🎓 مدیریت محتوای کنکوری:", reply_markup: await konkurSubMenu(env) });
+    return;
+  }
+  if (data === "back_main") {
+    await tg(env, "sendMessage", { chat_id: chatId, text: "منوی اصلی:", reply_markup: mainMenu(env) });
+    return;
+  }
+  if (data === "konkur_toggle") {
+    const settings = await konkur.getKonkurSettings(env);
+    settings.enabled = !settings.enabled;
+    await konkur.setKonkurSettings(env, settings);
+    await tg(env, "sendMessage", {
+      chat_id: chatId,
+      text: `قابلیت محتوای کنکوری الان: ${settings.enabled ? "فعال ✅" : "غیرفعال 🔴"}`,
+      reply_markup: await konkurSubMenu(env),
+    });
+    return;
+  }
+  if (data === "konkur_manual") {
+    await setState(env, adminId, { action: "konkur_manual_topic" });
+    await tg(env, "sendMessage", {
+      chat_id: chatId,
+      text: "موضوع مدنظرت رو بفرست (مثلاً: نکات مهم فصل ترمودینامیک شیمی):",
+    });
+    return;
+  }
+  if (data === "konkur_interval") {
+    await setState(env, adminId, { action: "konkur_set_interval" });
+    await tg(env, "sendMessage", { chat_id: chatId, text: "عدد بین ۱ تا ۸ (ساعت) رو بفرست:" });
+    return;
+  }
+  if (data === "konkur_hours") {
+    await setState(env, adminId, { action: "konkur_set_hours" });
+    await tg(env, "sendMessage", {
+      chat_id: chatId,
+      text: "ساعات فعال رو به وقت تهران بفرست، مثلاً: 8-23",
+    });
+    return;
+  }
+  if (data === "konkur_sites") {
+    const sites = await konkur.getKonkurSites(env);
+    const buttons = sites.map((s, i) => [{ text: `🗑 ${s.url}`, callback_data: `konkur_rm_site_${i}` }]);
+    buttons.push([{ text: "➕ افزودن سایت جدید", callback_data: "konkur_add_site" }]);
+    await tg(env, "sendMessage", {
+      chat_id: chatId,
+      text: sites.length ? "سایت‌های تحت پایش:" : "هنوز سایتی اضافه نشده.",
+      reply_markup: { inline_keyboard: buttons },
+    });
+    return;
+  }
+  if (data === "konkur_add_site") {
+    await setState(env, adminId, { action: "konkur_add_site" });
+    await tg(env, "sendMessage", {
+      chat_id: chatId,
+      text: "لینک کامل سایت(ها) رو بفرست (هر خط یکی)، مثل:\nhttps://example.com/konkur-news",
+    });
+    return;
+  }
+  if (data.startsWith("konkur_rm_site_")) {
+    const idx = parseInt(data.replace("konkur_rm_site_", ""), 10);
+    const sites = await konkur.getKonkurSites(env);
+    sites.splice(idx, 1);
+    await konkur.setKonkurSites(env, sites);
+    await tg(env, "sendMessage", { chat_id: chatId, text: "✅ حذف شد." });
+    return;
+  }
+  if (data === "konkur_stickers") {
+    const buttons = konkur.KONKUR_CATEGORIES.map((c, i) => [{ text: `🏷 ${c}`, callback_data: `konkur_stk_${i}` }]);
+    await tg(env, "sendMessage", {
+      chat_id: chatId,
+      text: "برای کدوم دسته می‌خوای استیکر اضافه کنی؟",
+      reply_markup: { inline_keyboard: buttons },
+    });
+    return;
+  }
+  if (data.startsWith("konkur_stk_")) {
+    const idx = parseInt(data.replace("konkur_stk_", ""), 10);
+    const category = konkur.KONKUR_CATEGORIES[idx];
+    await setState(env, adminId, { action: "konkur_add_sticker", category });
+    await tg(env, "sendMessage", {
+      chat_id: chatId,
+      text: `حالا استیکر(های) مرتبط با «${category}» رو یکی‌یکی بفرست. وقتی تموم شد بنویس: تمام`,
+    });
+    return;
+  }
+  if (data === "konkur_stats") {
+    const stats = await konkur.getKonkurStats(env);
+    const today = new Date().toISOString().slice(0, 10);
+    const approvedToday = stats.approved[today] || 0;
+    const rejectedToday = stats.rejected[today] || 0;
+    const totalApproved = Object.values(stats.approved).reduce((a, b) => a + b, 0);
+    const totalRejected = Object.values(stats.rejected).reduce((a, b) => a + b, 0);
+    const byCat =
+      Object.entries(stats.byCategory)
+        .sort((a, b) => b[1] - a[1])
+        .map(([c, n]) => `${c}: ${n}`)
+        .join("\n") || "—";
+    await tg(env, "sendMessage", {
+      chat_id: chatId,
+      text: `📈 آمار محتوای کنکوری:\nامروز: ${approvedToday} تایید، ${rejectedToday} رد\nکل: ${totalApproved} تایید، ${totalRejected} رد\n\nپرتایید‌ترین دسته‌ها:\n${byCat}`,
+    });
     return;
   }
 
@@ -1524,10 +1879,34 @@ export default {
       return new Response("polled");
     }
 
+    if (url.pathname === "/konkur-run") {
+      // manual trigger for testing the konkur automatic mode
+      await konkur.konkurTick(env, {
+        getFilterKeywords,
+        applyFilters,
+        getSignature,
+        tg,
+        getAdminIds,
+        queueForReview,
+      });
+      return new Response("konkur ticked");
+    }
+
     return new Response("repost-bot is running", { status: 200 });
   },
 
   async scheduled(event, env, ctx) {
     ctx.waitUntil(pollSources(env));
+    ctx.waitUntil(
+      konkur.konkurTick(env, {
+        getFilterKeywords,
+        applyFilters,
+        getSignature,
+        tg,
+        getAdminIds,
+        queueForReview,
+      })
+    );
+    ctx.waitUntil(konkur.konkurCheckSites(env, { tg, getAdminIds }));
   },
 };
