@@ -29,6 +29,12 @@ jobs:
           if [ -n "${{ secrets.RUBIKA_TOKEN }}" ]; then
             echo "${{ secrets.RUBIKA_TOKEN }}" | npx wrangler secret put RUBIKA_TOKEN
           fi
+          if [ -n "${{ secrets.SERPER_KEY }}" ]; then
+            echo "${{ secrets.SERPER_KEY }}" | npx wrangler secret put SERPER_KEY
+          fi
+          if [ -n "${{ secrets.GROQ_API_KEY }}" ]; then
+            echo "${{ secrets.GROQ_API_KEY }}" | npx wrangler secret put GROQ_API_KEY
+          fi
 
       - name: Deploy
         env:
