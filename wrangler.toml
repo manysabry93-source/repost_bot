@@ -13,5 +13,10 @@ crons = ["*/2 * * * *"]
 binding = "BOT_KV"
 id = "14977089594943f7be5cfd87d633da83"
 
+# Workers AI — برای ساخت عکس هوش مصنوعی (رایگان، همون اکانت Cloudflare)
+# وقتی جستجوی عکس نتیجه‌ای پیدا نکنه، از این استفاده می‌شه.
+[ai]
+binding = "AI"
+
 # این‌ها به‌صورت GitHub Secrets ست می‌شوند، نه اینجا:
-# BOT_TOKEN, ADMIN_IDS, WEBHOOK_SECRET
+# BOT_TOKEN, ADMIN_IDS, WEBHOOK_SECRET, SERPER_KEY, GROQ_API_KEY
